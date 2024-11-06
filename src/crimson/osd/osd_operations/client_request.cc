@@ -14,7 +14,6 @@
 #include "crimson/osd/osd_operations/client_request.h"
 #include "crimson/osd/osd_connection_priv.h"
 #include "osd/object_state_fmt.h"
-#include "osd/osd_perf_counters.h"
 
 SET_SUBSYS(osd);
 
@@ -191,25 +190,15 @@ ClientRequest::interruptible_future<> ClientRequest::with_pg_process_interruptib
       DEBUGDPP("{}.{}: dropping misdirected op",
 	       pg, *this, this_instance_id);
       co_return;
-    }
-
-    pg.get_perf_logger().inc(l_osd_replica_read);
-    if (pg.is_unreadable_object(m->get_hobj())) {
-      DEBUGDPP("{}.{}: {} missing on replica, bouncing to primary",
-	       pg, *this, this_instance_id, m->get_hobj());
-      pg.get_perf_logger().inc(l_osd_replica_read_redirect_missing);
-      co_await reply_op_error(pgref, -EAGAIN);
-      co_return;
-    } else if (!pg.get_peering_state().can_serve_replica_read(m->get_hobj())) {
+    } else if (const hobject_t& hoid = m->get_hobj();
+               !pg.get_peering_state().can_serve_replica_read(hoid)) {
       DEBUGDPP("{}.{}: unstable write on replica, bouncing to primary",
 	       pg, *this, this_instance_id);
-      pg.get_perf_logger().inc(l_osd_replica_read_redirect_conflict);
       co_await reply_op_error(pgref, -EAGAIN);
       co_return;
     } else {
       DEBUGDPP("{}.{}: serving replica read on oid {}",
 	       pg, *this, this_instance_id, m->get_hobj());
-      pg.get_perf_logger().inc(l_osd_replica_read_served);
     }
   }
 
@@ -301,40 +290,28 @@ ClientRequest::process_pg_op(
 ClientRequest::interruptible_future<>
 ClientRequest::recover_missing_snaps(
   Ref<PG> pg,
+  instance_handle_t &ihref,
+  ObjectContextRef head,
   std::set<snapid_t> &snaps)
 {
   LOG_PREFIX(ClientRequest::recover_missing_snaps);
-
-  std::vector<hobject_t> ret;
-  auto resolve_oids = pg->obc_loader.with_obc<RWState::RWREAD>(
-    m->get_hobj().get_head(),
-    [&snaps, &ret](auto head, auto) {
-    for (auto &snap : snaps) {
-      auto coid = head->obs.oi.soid;
-      coid.snap = snap;
-      auto oid = resolve_oid(head->get_head_ss(), coid);
-      /* Rollback targets may legitimately not exist if, for instance,
-       * the object is an rbd block which happened to be sparse and
-       * therefore non-existent at the time of the specified snapshot.
-       * In such a case, rollback will simply delete the object.  Here,
-       * we skip the oid as there is no corresponding clone to recover.
-       * See https://tracker.ceph.com/issues/63821 */
-      if (oid) {
-        ret.emplace_back(std::move(*oid));
+  for (auto &snap : snaps) {
+    auto coid = head->obs.oi.soid;
+    coid.snap = snap;
+    auto oid = resolve_oid(head->get_head_ss(), coid);
+    /* Rollback targets may legitimately not exist if, for instance,
+     * the object is an rbd block which happened to be sparse and
+     * therefore non-existent at the time of the specified snapshot.
+     * In such a case, rollback will simply delete the object.  Here,
+     * we skip the oid as there is no corresponding clone to recover.
+     * See https://tracker.ceph.com/issues/63821 */
+    if (oid) {
+      auto unfound = co_await do_recover_missing(pg, *oid, m->get_reqid());
+      if (unfound) {
+        DEBUGDPP("{} unfound, hang it for now", *pg, *oid);
+        co_await interruptor::make_interruptible(
+          pg->get_recovery_backend()->add_unfound(*oid));
       }
-    }
-    return seastar::now();
-  }).handle_error_interruptible(
-    crimson::ct_error::assert_all("unexpected error")
-  );
-  co_await std::move(resolve_oids);
-
-  for (auto &oid : ret) {
-    auto unfound = co_await do_recover_missing(pg, oid, m->get_reqid());
-    if (unfound) {
-      DEBUGDPP("{} unfound, hang it for now", *pg, oid);
-      co_await interruptor::make_interruptible(
-        pg->get_recovery_backend()->add_unfound(oid));
     }
   }
 }
@@ -360,7 +337,15 @@ ClientRequest::process_op(
 
     std::set<snapid_t> snaps = snaps_need_to_recover();
     if (!snaps.empty()) {
-      co_await recover_missing_snaps(pg, snaps);
+      auto with_obc = pg->obc_loader.with_obc<RWState::RWREAD>(
+        m->get_hobj().get_head(),
+        [&snaps, &ihref, pg, this](auto head, auto) {
+        return recover_missing_snaps(pg, ihref, head, snaps);
+      }).handle_error_interruptible(
+        crimson::ct_error::assert_all("unexpected error")
+      );
+      // see https://gcc.gnu.org/bugzilla/show_bug.cgi?id=98401
+      co_await std::move(with_obc);
     }
   }
 

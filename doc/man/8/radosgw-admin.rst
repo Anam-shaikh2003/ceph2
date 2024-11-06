@@ -476,19 +476,26 @@ as follows:
   Cancel resharding a bucket
 
 :command:`topic list`
-  List bucket notifications topics
+  List bucket notifications/pubsub topics                                                   
 
 :command:`topic get`
-  Get a bucket notification topic 
-
+  Get a bucket notifications/pubsub topic                                                   
+  
 :command:`topic rm`
-  Remove a bucket notifications topic 
+  Remove a bucket notifications/pubsub topic                                                
 
-:command:`topic stats`
-  Get a bucket notifications persistent topic stats (i.e. reservations, entries & size)
+:command:`subscription get`
+  Get a pubsub subscription definition
 
-:command:`topic dump`
-  Dump (in JSON format) all pending bucket notifications of a persistent topic
+:command:`subscription rm`
+  Remove a pubsub subscription
+
+:command:`subscription pull`
+  Show events in a pubsub subscription
+             
+:command:`subscription ack`
+  Acknowledge (remove) events in a pubsub subscription
+
 
 Options
 =======

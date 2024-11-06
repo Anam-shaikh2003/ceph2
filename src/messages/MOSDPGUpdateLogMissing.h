@@ -31,23 +31,7 @@ public:
   mempool::osd_pglog::list<pg_log_entry_t> entries;
   // piggybacked osd/pg state
   eversion_t pg_trim_to; // primary->replica: trim to here
-
-  /**
-   * pg_committed_to
-   *
-   * Propagates PeeringState::pg_committed_to to replicas as with
-   * MOSDRepOp, ECSubWrite
-   *
-   * Historical Note: Prior to early 2024, this field was named
-   * pg_roll_forward_to. pg_committed_to is a safe value to rollforward to as
-   * it is a conservative bound on versions that can become divergent.  Switching
-   * it to be populated by pg_committed_to rather than mlcod mirrors MOSDRepOp
-   * and upgrade cases in both directions should be safe as mlcod is <= pct
-   * and replicas (both ec and replicated) only actually rely on versions <= this
-   * field being non-divergent. This note may be removed in main after U is
-   * released.
-   */
-  eversion_t pg_committed_to;
+  eversion_t pg_roll_forward_to; // primary->replica: trim rollback info to here
 
   epoch_t get_epoch() const { return map_epoch; }
   spg_t get_pgid() const { return pgid; }
@@ -75,7 +59,7 @@ public:
     epoch_t min_epoch,
     ceph_tid_t rep_tid,
     eversion_t pg_trim_to,
-    eversion_t pg_committed_to)
+    eversion_t pg_roll_forward_to)
     : MOSDFastDispatchOp{MSG_OSD_PG_UPDATE_LOG_MISSING, HEAD_VERSION,
 			 COMPAT_VERSION},
       map_epoch(epoch),
@@ -85,7 +69,7 @@ public:
       rep_tid(rep_tid),
       entries(entries),
       pg_trim_to(pg_trim_to),
-      pg_committed_to(pg_committed_to)
+      pg_roll_forward_to(pg_roll_forward_to)
   {}
 
 private:
@@ -99,7 +83,7 @@ public:
 	<< " rep_tid " << rep_tid
 	<< " entries " << entries
 	<< " trim_to " << pg_trim_to
-	<< " pg_committed_to " << pg_committed_to
+	<< " roll_forward_to " << pg_roll_forward_to
 	<< ")";
   }
 
@@ -112,7 +96,7 @@ public:
     encode(entries, payload);
     encode(min_epoch, payload);
     encode(pg_trim_to, payload);
-    encode(pg_committed_to, payload);
+    encode(pg_roll_forward_to, payload);
   }
   void decode_payload() override {
     using ceph::decode;
@@ -129,7 +113,7 @@ public:
     }
     if (header.version >= 3) {
       decode(pg_trim_to, p);
-      decode(pg_committed_to, p);
+      decode(pg_roll_forward_to, p);
     }
   }
 private:

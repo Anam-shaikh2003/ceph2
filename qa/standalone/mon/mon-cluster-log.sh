@@ -62,7 +62,7 @@ function TEST_cluster_log_level() {
     ceph config set mon.a mon_cluster_log_level info
     ceph osd down 0
     TIMEOUT=20 wait_for_osd up 0 || return 1
-    TIMEOUT=60 wait_for_string $dir/log "cluster [[]INF[]] osd.0.*boot" 
+    grep -q "cluster [[]INF[]] osd.0.*boot" $dir/log
     return_code=$?
     if [ $return_code -ne 0 ]; then
       echo "Failed : Could not find INF log in the cluster log file"
@@ -145,17 +145,9 @@ function TEST_journald_cluster_log_level() {
     ceph osd down 0
     TIMEOUT=20 wait_for_osd up 0 || return 1
     search_str="osd.0.*boot"
-    return_code=1
-    RETRY_DURATION=60 
-    for ((i=0; i < $RETRY_DURATION; i++)); do
-      sudo journalctl _COMM=ceph-mon CEPH_CHANNEL=cluster PRIORITY=6 --output=json-pretty --since "60 seconds ago" |jq '.MESSAGE' > $dir/journal.log
-      if ! grep "$search_str" $dir/journal.log; then
-        sleep 1
-      else
-        return_code=0
-        break
-      fi
-    done
+    sudo journalctl _COMM=ceph-mon CEPH_CHANNEL=cluster PRIORITY=6 --output=json-pretty --since "60 seconds ago" |jq '.MESSAGE' > $dir/journal.log
+    grep -q "$search_str" $dir/journal.log
+    return_code=$?
     if [ $return_code -ne 0 ]; then
       echo "Failed : Could not find INF log in the journalctl log file"
       ERRORS=$(($ERRORS + 1))

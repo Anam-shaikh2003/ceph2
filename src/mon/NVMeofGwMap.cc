@@ -665,8 +665,6 @@ void NVMeofGwMap::fsm_handle_gw_no_subsystems(
   break;
 
   case gw_states_per_group_t::GW_WAIT_FAILBACK_PREPARED:
-  {
-    auto& gw_id_st = created_gws[group_key][gw_id];
     cancel_timer(gw_id, group_key,  grpid);
     map_modified = true;
     for (auto& gw_st: created_gws[group_key]) {
@@ -675,18 +673,13 @@ void NVMeofGwMap::fsm_handle_gw_no_subsystems(
       if (st.sm_state[grpid] ==
       gw_states_per_group_t::GW_OWNER_WAIT_FAILBACK_PREPARED) {
     dout(4) << "Warning: Outgoing Failback when GW is without subsystems"
-        <<" Owner GW set to standby state " << gw_st.first << "for ANA Group "
+        << " - to rollback it" <<" GW " << gw_id << "for ANA Group "
         << grpid << dendl;
     st.standby_state(grpid);
     break;
       }
     }
-    dout(4) << "Warning: Outgoing Failback when GW is without subsystems"
-       <<" Failback GW set to standby state " << gw_id << "for ANA Group "
-       << grpid << dendl;
-    gw_id_st.standby_state(grpid);
-  }
-  break;
+    break;
 
   case gw_states_per_group_t::GW_OWNER_WAIT_FAILBACK_PREPARED:
   case gw_states_per_group_t::GW_ACTIVE_STATE:
@@ -723,8 +716,6 @@ void NVMeofGwMap::fsm_handle_gw_down(
   break;
 
   case gw_states_per_group_t::GW_WAIT_FAILBACK_PREPARED:
-  {
-    auto& gw_id_st = created_gws[group_key][gw_id];
     cancel_timer(gw_id, group_key,  grpid);
     map_modified = true;
     for (auto& gw_st: created_gws[group_key]) {
@@ -733,18 +724,13 @@ void NVMeofGwMap::fsm_handle_gw_down(
       if (st.sm_state[grpid] ==
 	  gw_states_per_group_t::GW_OWNER_WAIT_FAILBACK_PREPARED) {
 	dout(4) << "Warning: Outgoing Failback when GW is down back"
-		<<"Owner GW set to standby state " << gw_id << "for ANA Group "
+		<< " - to rollback it" <<" GW " << gw_id << "for ANA Group "
 		<< grpid << dendl;
 	st.standby_state(grpid);
 	break;
       }
     }
-    dout(4) << "Warning: Outgoing Failback when GW is down back"
-       <<" Failback GW set to standby state " << gw_id << "for ANA Group "
-       << grpid << dendl;
-    gw_id_st.standby_state(grpid);
-  }
-  break;
+    break;
 
   case gw_states_per_group_t::GW_OWNER_WAIT_FAILBACK_PREPARED:
     // nothing to do - let failback timer expire

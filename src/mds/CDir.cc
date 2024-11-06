@@ -3808,13 +3808,10 @@ bool CDir::should_split_fast() const
     const CDentry *dn = p.second;
     if (!dn->get_projected_linkage()->is_null()) {
       effective_size++;
-
-      if (effective_size > fast_limit) [[unlikely]]
-	return true;
     }
   }
 
-  return false;
+  return effective_size > fast_limit;
 }
 
 bool CDir::should_merge() const

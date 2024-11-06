@@ -3,13 +3,14 @@ meta:
    install upgrade ceph/-x on cluster
    restart : mons, osd.*
 tasks:
-- print: "**** start install.upgrade of nodes"
 - install.upgrade:
-    all:
+    mon.a:
+- exec:
+    osd.0:
+      - ceph osd require-osd-release quincy
 - print: "**** done install.upgrade of nodes"
-- print: "**** start ceph.restart of all osds"
 - ceph.restart:
-    daemons: [osd.0,osd.1,osd.2]
+    daemons: [mon.a,mgr.x,osd.0,osd.1,osd.2]
     mon-health-to-clog: false
     wait-for-healthy: false
     wait-for-osds-up: false

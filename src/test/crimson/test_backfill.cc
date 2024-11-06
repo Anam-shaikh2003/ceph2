@@ -91,11 +91,9 @@ struct FakePrimary {
   eversion_t last_update;
   eversion_t projected_last_update;
   eversion_t log_tail;
-  PGLog pg_log;
-  PGLog::IndexedLog projected_log;
 
   FakePrimary(FakeStore&& store)
-    : store(std::move(store)), pg_log(nullptr) {
+    : store(std::move(store)) {
   }
 };
 
@@ -236,10 +234,6 @@ struct BackfillFixture::PeeringFacade
     return backfill_source.log_tail;
   }
 
-  const PGLog& get_pg_log() const override {
-    return backfill_source.pg_log;
-  }
-
   void scan_log_after(eversion_t, scan_log_func_t) const override {
     /* NOP */
   }
@@ -269,11 +263,6 @@ struct BackfillFixture::PGFacade : public crimson::osd::BackfillState::PGFacade 
   const eversion_t& get_projected_last_update() const override {
     return backfill_source.projected_last_update;
   }
-
-  const PGLog::IndexedLog& get_projected_log() const override {
-    return backfill_source.projected_log;
-  }
-
 };
 
 BackfillFixture::BackfillFixture(

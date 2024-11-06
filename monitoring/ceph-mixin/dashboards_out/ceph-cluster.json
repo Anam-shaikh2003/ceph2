@@ -35,20 +35,7 @@
   "hideControls": false,
   "id": null,
   "iteration": 1525415495309,
-  "links": [
-    {
-      "asDropdown": true,
-      "icon": "external link",
-      "includeVars": true,
-      "keepTime": true,
-      "tags": [],
-      "targetBlank": false,
-      "title": "Browse Dashboards",
-      "tooltip": "",
-      "type": "dashboards",
-      "url": ""
-    }
-  ],
+  "links": [],
   "panels": [
     {
       "cacheTimeout": null,

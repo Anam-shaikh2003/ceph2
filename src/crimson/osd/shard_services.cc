@@ -802,19 +802,15 @@ seastar::future<> ShardServices::dispatch_context_messages(
 
 seastar::future<> ShardServices::dispatch_context(
   crimson::os::CollectionRef col,
-  PeeringCtx &&pctx)
+  PeeringCtx &&ctx)
 {
-  return seastar::do_with(
-    std::move(pctx),
-    [this, col](auto &ctx) {
-    ceph_assert(col || ctx.transaction.empty());
-    return seastar::when_all_succeed(
-      dispatch_context_messages(
-       BufferedRecoveryMessages{ctx}),
-      col ? dispatch_context_transaction(col, ctx) : seastar::now()
-    ).then_unpack([] {
-      return seastar::now();
-    });
+  ceph_assert(col || ctx.transaction.empty());
+  return seastar::when_all_succeed(
+    dispatch_context_messages(
+      BufferedRecoveryMessages{ctx}),
+    col ? dispatch_context_transaction(col, ctx) : seastar::now()
+  ).then_unpack([] {
+    return seastar::now();
   });
 }
 

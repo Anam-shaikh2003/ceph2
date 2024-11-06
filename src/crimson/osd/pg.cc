@@ -132,7 +132,6 @@ PG::PG(
 	pool,
 	name),
       osdmap,
-      PG_FEATURE_CRIMSON_ALL,
       this,
       this),
     scrubber(*this),
@@ -393,13 +392,7 @@ void PG::on_replica_activate()
 
 void PG::on_activate_complete()
 {
-  /* Confusingly, on_activate_complete is invoked when the primary and replicas
-   * have recorded the current interval.  At that point, the PG may either become
-   * ACTIVE or PEERED, depending on whether the acting set is eligible for client
-   * IO.  Only unblock wait_for_active_blocker if we actually became ACTIVE */
-  if (peering_state.is_active()) {
-    wait_for_active_blocker.unblock();
-  }
+  wait_for_active_blocker.unblock();
 
   if (peering_state.needs_recovery()) {
     logger().info("{}: requesting recovery",
@@ -932,10 +925,6 @@ PG::submit_transaction(
   ceph_assert(log_entries.rbegin()->version >= projected_last_update);
   projected_last_update = log_entries.rbegin()->version;
 
-  for (const auto& entry: log_entries) {
-    projected_log.add(entry);
-  }
-
   auto [submitted, all_completed] = co_await backend->submit_transaction(
       peering_state.get_acting_recovery_backfill(),
       obc->obs.oi.soid,
@@ -1045,7 +1034,7 @@ PG::interruptible_future<eversion_t> PG::submit_error_log(
   ceph::os::Transaction t;
   peering_state.merge_new_log_entries(
     log_entries, t, peering_state.get_pg_trim_to(),
-    peering_state.get_pg_committed_to());
+    peering_state.get_min_last_complete_ondisk());
 
   return seastar::do_with(log_entries, set<pg_shard_t>{},
     [this, t=std::move(t), rep_tid](auto& log_entries, auto& waiting_on) mutable {
@@ -1066,7 +1055,7 @@ PG::interruptible_future<eversion_t> PG::submit_error_log(
                    get_last_peering_reset(),
                    rep_tid,
                    peering_state.get_pg_trim_to(),
-                   peering_state.get_pg_committed_to());
+                   peering_state.get_min_last_complete_ondisk());
       waiting_on.insert(peer);
       logger().debug("submit_error_log: sending log"
         "missing_request (rep_tid: {} entries: {})"
@@ -1283,7 +1272,7 @@ PG::interruptible_future<> PG::handle_rep_op(Ref<MOSDRepOp> req)
   log_operation(std::move(log_entries),
                 req->pg_trim_to,
                 req->version,
-                req->pg_committed_to,
+                req->min_last_complete_ondisk,
                 !txn.empty(),
                 txn,
                 false);
@@ -1329,23 +1318,27 @@ void PG::log_operation(
   std::vector<pg_log_entry_t>&& logv,
   const eversion_t &trim_to,
   const eversion_t &roll_forward_to,
-  const eversion_t &pg_committed_to,
+  const eversion_t &min_last_complete_ondisk,
   bool transaction_applied,
   ObjectStore::Transaction &txn,
   bool async) {
   logger().debug("{}", __func__);
   if (is_primary()) {
-    ceph_assert(trim_to <= peering_state.get_pg_committed_to());
+    ceph_assert(trim_to <= peering_state.get_last_update_ondisk());
   }
+  /* TODO: when we add snap mapper and projected log support,
+   * we'll likely want to update them here.
+   *
+   * See src/osd/PrimaryLogPG.h:log_operation for how classic
+   * handles these cases.
+   */
+#if 0
   auto last = logv.rbegin();
   if (is_primary() && last != logv.rend()) {
-    logger().debug("{} on primary, trimming projected log",
-                   __func__);
     projected_log.skip_can_rollback_to_to_head();
-    projected_log.trim(shard_services.get_cct(), last->version,
-                       nullptr, nullptr, nullptr);
+    projected_log.trim(cct, last->version, nullptr, nullptr, nullptr);
   }
-
+#endif
   if (!is_primary()) { // && !is_ec_pg()
     replica_clear_repop_obc(logv);
   }
@@ -1355,7 +1348,7 @@ void PG::log_operation(
   peering_state.append_log(std::move(logv),
                            trim_to,
                            roll_forward_to,
-                           pg_committed_to,
+                           min_last_complete_ondisk,
                            txn,
                            !txn.empty(),
                            false);
@@ -1394,17 +1387,17 @@ PG::interruptible_future<> PG::do_update_log_missing(
 
   ceph_assert(m->get_type() == MSG_OSD_PG_UPDATE_LOG_MISSING);
   ObjectStore::Transaction t;
-  std::optional<eversion_t> op_trim_to, op_pg_committed_to;
+  std::optional<eversion_t> op_trim_to, op_roll_forward_to;
   if (m->pg_trim_to != eversion_t())
     op_trim_to = m->pg_trim_to;
-  if (m->pg_committed_to != eversion_t())
-    op_pg_committed_to = m->pg_committed_to;
-  logger().debug("op_trim_to = {}, op_pg_committed_to = {}",
+  if (m->pg_roll_forward_to != eversion_t())
+    op_roll_forward_to = m->pg_roll_forward_to;
+  logger().debug("op_trim_to = {}, op_roll_forward_to = {}",
     op_trim_to.has_value() ? *op_trim_to : eversion_t(),
-    op_pg_committed_to.has_value() ? *op_pg_committed_to : eversion_t());
+    op_roll_forward_to.has_value() ? *op_roll_forward_to : eversion_t());
 
   peering_state.append_log_entries_update_missing(
-    m->entries, t, op_trim_to, op_pg_committed_to);
+    m->entries, t, op_trim_to, op_roll_forward_to);
 
   return interruptor::make_interruptible(shard_services.get_store().do_transaction(
     coll_ref, std::move(t))).then_interruptible(
@@ -1622,21 +1615,14 @@ bool PG::should_send_op(
     return true;
   bool should_send =
     (hoid.pool != (int64_t)get_info().pgid.pool() ||
-    // An object has been fully pushed to the backfill target if and only if
-    // either of the following conditions is met:
-    // 1. peer_info.last_backfill has passed "hoid"
-    // 2. last_backfill_started has passed "hoid" and "hoid" is not in the peer
-    //    missing set
-    hoid <= peering_state.get_peer_info(peer).last_backfill ||
-    (has_backfill_state() && hoid <= get_last_backfill_started() &&
-     !peering_state.get_peer_missing(peer).is_missing(hoid)));
+    (has_backfill_state() && hoid <= get_last_backfill_started()) ||
+    hoid <= peering_state.get_peer_info(peer).last_backfill);
   if (!should_send) {
     ceph_assert(is_backfill_target(peer));
     logger().debug("{} issue_repop shipping empty opt to osd."
                    "{}, object {} beyond std::max(last_backfill_started, "
                    "peer_info[peer].last_backfill {})",
-                   __func__, peer, hoid,
-                   peering_state.get_peer_info(peer).last_backfill);
+                   peer, hoid, peering_state.get_peer_info(peer).last_backfill);
   }
   return should_send;
   // TODO: should consider async recovery cases in the future which are not supported
@@ -1651,8 +1637,8 @@ PG::already_complete(const osd_reqid_t& reqid)
   int ret;
   std::vector<pg_log_op_return_item_t> op_returns;
 
-  if (check_in_progress_op(
-        reqid, &version, &user_version, &ret, &op_returns)) {
+  if (peering_state.get_pg_log().get_log().get_request(
+	reqid, &version, &user_version, &ret, &op_returns)) {
     complete_op_t dupinfo{
       user_version,
       version,
@@ -1717,19 +1703,4 @@ void PG::C_PG_FinishRecovery::finish(int r) {
     DEBUGDPP("stale recovery finsher", pg);
   }
 }
-bool PG::check_in_progress_op(
-  const osd_reqid_t& reqid,
-  eversion_t *version,
-  version_t *user_version,
-  int *return_code,
-  std::vector<pg_log_op_return_item_t> *op_returns
-  ) const
-{
-  return (
-    projected_log.get_request(reqid, version, user_version, return_code,
-                              op_returns) ||
-    peering_state.get_pg_log().get_log().get_request(
-      reqid, version, user_version, return_code, op_returns));
-}
-
 }

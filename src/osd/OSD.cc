@@ -504,8 +504,6 @@ void OSDService::shutdown_reserver()
 
 void OSDService::shutdown()
 {
-  pg_timer.stop();
-
   mono_timer.suspend();
 
   {
@@ -9503,8 +9501,7 @@ void OSD::handle_pg_query_nopg(const MQuery& q)
 			 q.query.epoch_sent,
 			 osdmap->get_epoch(),
 			 empty,
-			 PastIntervals(),
-			 PG_FEATURE_CLASSIC_ALL};
+			 PastIntervals()};
       m = new MOSDPGNotify2(spg_t{pgid.pgid, q.query.from},
 			    std::move(notify));
     }
@@ -10173,28 +10170,22 @@ void OSD::maybe_override_max_osd_capacity_for_qos()
             << dendl;
 
     // Get the threshold IOPS set for the underlying hdd/ssd.
-    double hi_threshold_iops = 0.0;
-    double lo_threshold_iops = 0.0;
+    double threshold_iops = 0.0;
     if (store_is_rotational) {
-      hi_threshold_iops = cct->_conf.get_val<double>(
+      threshold_iops = cct->_conf.get_val<double>(
         "osd_mclock_iops_capacity_threshold_hdd");
-      lo_threshold_iops = cct->_conf.get_val<double>(
-        "osd_mclock_iops_capacity_low_threshold_hdd");
     } else {
-      hi_threshold_iops = cct->_conf.get_val<double>(
+      threshold_iops = cct->_conf.get_val<double>(
         "osd_mclock_iops_capacity_threshold_ssd");
-      lo_threshold_iops = cct->_conf.get_val<double>(
-        "osd_mclock_iops_capacity_low_threshold_ssd");
     }
 
     // Persist the iops value to the MON store or throw cluster warning
-    // if the measured iops is not in the threshold range. If the iops is
-    // not within the threshold range, the current/default value is retained.
-    if (iops < lo_threshold_iops || iops > hi_threshold_iops) {
+    // if the measured iops exceeds the set threshold. If the iops exceed
+    // the threshold, the default value is used.
+    if (iops > threshold_iops) {
       clog->warn() << "OSD bench result of " << std::to_string(iops)
-                   << " IOPS is not within the threshold limit range of "
-                   << std::to_string(lo_threshold_iops) << " IOPS and "
-                   << std::to_string(hi_threshold_iops) << " IOPS for osd."
+                   << " IOPS exceeded the threshold limit of "
+                   << std::to_string(threshold_iops) << " IOPS for osd."
                    << std::to_string(whoami) << ". IOPS capacity is unchanged"
                    << " at " << std::to_string(cur_iops) << " IOPS. The"
                    << " recommendation is to establish the osd's IOPS capacity"

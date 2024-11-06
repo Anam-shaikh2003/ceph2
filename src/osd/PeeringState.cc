@@ -109,7 +109,6 @@ PeeringState::PeeringState(
   spg_t spgid,
   const PGPool &_pool,
   OSDMapRef curmap,
-  pg_feature_vec_t supported_pg_acting_features,
   DoutPrefixProvider *dpp,
   PeeringListener *pl)
   : state_history(*pl),
@@ -123,8 +122,6 @@ PeeringState::PeeringState(
     pg_whoami(pg_whoami),
     info(spgid),
     pg_log(cct),
-    local_pg_acting_features(supported_pg_acting_features),
-    pg_acting_features(local_pg_acting_features),
     last_require_osd_release(curmap->require_osd_release),
     missing_loc(spgid, this, dpp, cct),
     machine(this, cct, spgid, dpp, pl, &state_history)
@@ -317,11 +314,9 @@ void PeeringState::query_unfound(Formatter *f, string state)
   return;
 }
 
-bool PeeringState::proc_replica_notify(const pg_shard_t &from, const pg_notify_t &notify)
+bool PeeringState::proc_replica_info(
+  pg_shard_t from, const pg_info_t &oinfo, epoch_t send_epoch)
 {
-  const pg_info_t &oinfo = notify.info;
-  const epoch_t send_epoch = notify.epoch_sent;
-
   auto p = peer_info.find(from);
   if (p != peer_info.end() && p->second.last_update == oinfo.last_update) {
     psdout(10) << " got dup osd." << from << " info "
@@ -349,10 +344,6 @@ bool PeeringState::proc_replica_notify(const pg_shard_t &from, const pg_notify_t
     if (is_clean()) {
       purge_strays();
     }
-  }
-
-  if (is_acting(from)) {
-    pg_acting_features &= notify.pg_features;
   }
 
   // was this a new info?  if so, update peers!
@@ -755,7 +746,6 @@ void PeeringState::on_new_interval()
   // initialize features
   acting_features = CEPH_FEATURES_SUPPORTED_DEFAULT;
   upacting_features = CEPH_FEATURES_SUPPORTED_DEFAULT;
-  pg_acting_features = local_pg_acting_features;
   for (auto p = acting.begin(); p != acting.end(); ++p) {
     if (*p == CRUSH_ITEM_NONE)
       continue;
@@ -910,7 +900,7 @@ void PeeringState::clear_primary_state()
 
   clear_recovery_state();
 
-  pg_committed_to = eversion_t();
+  last_update_ondisk = eversion_t();
   missing_loc.clear();
   pl->clear_primary_state();
 }
@@ -1414,8 +1404,9 @@ bool PeeringState::needs_backfill() const
 bool PeeringState::can_serve_replica_read(const hobject_t &hoid)
 {
   ceph_assert(!is_primary());
+  eversion_t min_last_complete_ondisk = get_min_last_complete_ondisk();
   if (!pg_log.get_log().has_write_since(
-      hoid, pg_committed_to)) {
+      hoid, min_last_complete_ondisk)) {
     psdout(20) << "can be safely read on this replica" << dendl;
     return true;
   } else {
@@ -2672,10 +2663,6 @@ void PeeringState::activate(
 	     info.last_epoch_started <= activation_epoch);
       info.last_epoch_started = activation_epoch;
       info.last_interval_started = info.history.same_interval_since;
-
-      // updating last_epoch_started ensures that last_update will not
-      // become divergent after activation completes.
-      pg_committed_to = info.last_update;
     }
   } else if (is_acting(pg_whoami)) {
     /* update last_epoch_started on acting replica to whatever the primary sent
@@ -2684,16 +2671,15 @@ void PeeringState::activate(
     if (info.last_epoch_started < activation_epoch) {
       info.last_epoch_started = activation_epoch;
       info.last_interval_started = info.history.same_interval_since;
-
-      // updating last_epoch_started ensures that last_update will not
-      // become divergent after activation completes.
-      pg_committed_to = info.last_update;
     }
   }
 
   auto &missing = pg_log.get_missing();
 
   min_last_complete_ondisk = eversion_t(0,0);  // we don't know (yet)!
+  if (is_primary()) {
+    last_update_ondisk = info.last_update;
+  }
   last_update_applied = info.last_update;
   last_rollback_info_trimmed_to_applied = pg_log.get_can_rollback_to();
 
@@ -3215,8 +3201,7 @@ void PeeringState::fulfill_query(const MQuery& query, PeeringCtxWrapper &rctx)
 	query.query_epoch,
 	get_osdmap_epoch(),
 	notify_info.second,
-	past_intervals,
-	local_pg_acting_features));
+	past_intervals));
   } else {
     update_history(query.query.history);
     fulfill_log(query.from, query.query, query.query_epoch);
@@ -4085,7 +4070,7 @@ void PeeringState::update_stats_wo_resched(
 bool PeeringState::append_log_entries_update_missing(
   const mempool::osd_pglog::list<pg_log_entry_t> &entries,
   ObjectStore::Transaction &t, std::optional<eversion_t> trim_to,
-  std::optional<eversion_t> pg_committed_to)
+  std::optional<eversion_t> roll_forward_to)
 {
   ceph_assert(!entries.empty());
   ceph_assert(entries.begin()->version > info.last_update);
@@ -4097,12 +4082,12 @@ bool PeeringState::append_log_entries_update_missing(
       entries,
       rollbacker.get());
 
-  if (pg_committed_to && entries.rbegin()->soid > info.last_backfill) {
+  if (roll_forward_to && entries.rbegin()->soid > info.last_backfill) {
     pg_log.roll_forward(rollbacker.get());
   }
-  if (pg_committed_to && *pg_committed_to > pg_log.get_can_rollback_to()) {
-    pg_log.roll_forward_to(*pg_committed_to, rollbacker.get());
-    last_rollback_info_trimmed_to_applied = *pg_committed_to;
+  if (roll_forward_to && *roll_forward_to > pg_log.get_can_rollback_to()) {
+    pg_log.roll_forward_to(*roll_forward_to, rollbacker.get());
+    last_rollback_info_trimmed_to_applied = *roll_forward_to;
   }
 
   info.last_update = pg_log.get_head();
@@ -4126,13 +4111,12 @@ void PeeringState::merge_new_log_entries(
   const mempool::osd_pglog::list<pg_log_entry_t> &entries,
   ObjectStore::Transaction &t,
   std::optional<eversion_t> trim_to,
-  std::optional<eversion_t> pg_committed_to)
+  std::optional<eversion_t> roll_forward_to)
 {
   psdout(10) << entries << dendl;
   ceph_assert(is_primary());
 
-  bool rebuild_missing = append_log_entries_update_missing(
-    entries, t, trim_to, pg_committed_to);
+  bool rebuild_missing = append_log_entries_update_missing(entries, t, trim_to, roll_forward_to);
   for (auto i = acting_recovery_backfill.begin();
        i != acting_recovery_backfill.end();
        ++i) {
@@ -4200,7 +4184,7 @@ void PeeringState::append_log(
   vector<pg_log_entry_t>&& logv,
   eversion_t trim_to,
   eversion_t roll_forward_to,
-  eversion_t pct,
+  eversion_t mlcod,
   ObjectStore::Transaction &t,
   bool transaction_applied,
   bool async)
@@ -4266,7 +4250,7 @@ void PeeringState::append_log(
   write_if_dirty(t);
 
   if (!is_primary())
-    pg_committed_to = pct;
+    min_last_complete_ondisk = mlcod;
 }
 
 void PeeringState::recover_got(
@@ -4453,7 +4437,7 @@ void PeeringState::recovery_committed_to(eversion_t version)
 
 void PeeringState::complete_write(eversion_t v, eversion_t lc)
 {
-  pg_committed_to = v;
+  last_update_ondisk = v;
   last_complete_ondisk = lc;
   calc_min_last_complete_ondisk();
 }
@@ -4500,7 +4484,7 @@ void PeeringState::calc_trim_to_aggressive()
   eversion_t limit = std::min({
     pg_log.get_head(),
     pg_log.get_can_rollback_to(),
-    pg_committed_to});
+    last_update_ondisk});
   psdout(10) << "limit = " << limit << dendl;
 
   if (limit != eversion_t() &&
@@ -4660,7 +4644,8 @@ PeeringState::Initial::Initial(my_context ctx)
 boost::statechart::result PeeringState::Initial::react(const MNotifyRec& notify)
 {
   DECLARE_LOCALS;
-  ps->proc_replica_notify(notify.from, notify.notify);
+  ps->proc_replica_info(
+    notify.from, notify.notify.info, notify.notify.epoch_sent);
   ps->set_last_peering_reset();
   return transit< Primary >();
 }
@@ -4813,8 +4798,7 @@ boost::statechart::result PeeringState::Reset::react(const ActMap&)
 	ps->get_osdmap_epoch(),
 	ps->get_osdmap_epoch(),
 	ps->info,
-	ps->past_intervals,
-	ps->local_pg_acting_features));
+	ps->past_intervals));
   }
 
   ps->update_heartbeat_peers();
@@ -4904,7 +4888,8 @@ boost::statechart::result PeeringState::Primary::react(const MNotifyRec& notevt)
 {
   DECLARE_LOCALS;
   psdout(7) << "handle_pg_notify from osd." << notevt.from << dendl;
-  ps->proc_replica_notify(notevt.from, notevt.notify);
+  ps->proc_replica_info(
+    notevt.from, notevt.notify.info, notevt.notify.epoch_sent);
   return discard_event();
 }
 
@@ -6119,9 +6104,10 @@ boost::statechart::result PeeringState::Active::react(const MNotifyRec& notevt)
 		       << dendl;
   } else {
     psdout(10) << "Active: got notify from " << notevt.from
-		       << ", calling proc_replica_notify and discover_all_missing"
+		       << ", calling proc_replica_info and discover_all_missing"
 		       << dendl;
-    ps->proc_replica_notify(notevt.from, notevt.notify);
+    ps->proc_replica_info(
+      notevt.from, notevt.notify.info, notevt.notify.epoch_sent);
     if (ps->have_unfound() || (ps->is_degraded() && ps->might_have_unfound.count(notevt.from))) {
       ps->discover_all_missing(
 	context<PeeringMachine>().get_recovery_ctx().msgs);
@@ -6544,8 +6530,7 @@ boost::statechart::result PeeringState::ReplicaActive::react(const ActMap&)
 	ps->get_osdmap_epoch(),
 	ps->get_osdmap_epoch(),
 	ps->info,
-	ps->past_intervals,
-	ps->local_pg_acting_features));
+	ps->past_intervals));
   }
   return discard_event();
 }
@@ -6682,8 +6667,7 @@ boost::statechart::result PeeringState::Stray::react(const ActMap&)
 	ps->get_osdmap_epoch(),
 	ps->get_osdmap_epoch(),
 	ps->info,
-	ps->past_intervals,
-	ps->local_pg_acting_features));
+	ps->past_intervals));
   }
   return discard_event();
 }
@@ -6882,7 +6866,8 @@ boost::statechart::result PeeringState::GetInfo::react(const MNotifyRec& infoevt
   }
 
   epoch_t old_start = ps->info.history.last_epoch_started;
-  if (ps->proc_replica_notify(infoevt.from, infoevt.notify)) {
+  if (ps->proc_replica_info(
+	infoevt.from, infoevt.notify.info, infoevt.notify.epoch_sent)) {
     // we got something new ...
     PastIntervals::PriorSet &prior_set = context< Peering >().prior_set;
     if (old_start < ps->info.history.last_epoch_started) {
@@ -6913,7 +6898,6 @@ boost::statechart::result PeeringState::GetInfo::react(const MNotifyRec& infoevt
       psdout(20) << "Common peer features: " << hex << ps->get_min_peer_features() << dec << dendl;
       psdout(20) << "Common acting features: " << hex << ps->get_min_acting_features() << dec << dendl;
       psdout(20) << "Common upacting features: " << hex << ps->get_min_upacting_features() << dec << dendl;
-      psdout(20) << "Common pg_acting_features: " << hex << ps->get_pg_acting_features() << dec << dendl;
       post_event(GotInfo());
     }
   }
@@ -7276,7 +7260,8 @@ boost::statechart::result PeeringState::Incomplete::react(const AdvMap &advmap) 
 boost::statechart::result PeeringState::Incomplete::react(const MNotifyRec& notevt) {
   DECLARE_LOCALS;
   psdout(7) << "handle_pg_notify from osd." << notevt.from << dendl;
-  if (ps->proc_replica_notify(notevt.from, notevt.notify)) {
+  if (ps->proc_replica_info(
+    notevt.from, notevt.notify.info, notevt.notify.epoch_sent)) {
     // We got something new, try again!
     return transit< GetLog >();
   } else {
@@ -7566,8 +7551,8 @@ ostream &operator<<(ostream &out, const PeeringState &ps) {
   }
 
   if (ps.is_peered()) {
-    if (ps.pg_committed_to != ps.info.last_update)
-      out << " pct=" << ps.pg_committed_to;
+    if (ps.last_update_ondisk != ps.info.last_update)
+      out << " luod=" << ps.last_update_ondisk;
     if (ps.last_update_applied != ps.info.last_update)
       out << " lua=" << ps.last_update_applied;
   }
@@ -7590,8 +7575,7 @@ ostream &operator<<(ostream &out, const PeeringState &ps) {
   if (ps.last_complete_ondisk != ps.info.last_complete)
     out << " lcod " << ps.last_complete_ondisk;
 
-  if (ps.is_primary())
-    out << " mlcod " << ps.min_last_complete_ondisk;
+  out << " mlcod " << ps.min_last_complete_ondisk;
 
   out << " " << pg_state_string(ps.get_state());
   if (ps.should_send_notify())

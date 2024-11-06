@@ -14,7 +14,6 @@
 #include "common/errno.h"
 #include "ReplicatedBackend.h"
 #include "messages/MOSDOp.h"
-#include "messages/MOSDPGPCT.h"
 #include "messages/MOSDRepOp.h"
 #include "messages/MOSDRepOpReply.h"
 #include "messages/MOSDPGPush.h"
@@ -125,9 +124,7 @@ ReplicatedBackend::ReplicatedBackend(
   ObjectStore::CollectionHandle &c,
   ObjectStore *store,
   CephContext *cct) :
-  PGBackend(cct, pg, store, coll, c),
-  pct_callback(this)
-{}
+  PGBackend(cct, pg, store, coll, c) {}
 
 void ReplicatedBackend::run_recovery_op(
   PGBackend::RecoveryHandle *_h,
@@ -232,10 +229,6 @@ bool ReplicatedBackend::_handle_message(
     return true;
   }
 
-  case MSG_OSD_PG_PCT:
-    do_pct(op);
-    return true;
-
   default:
     break;
   }
@@ -268,7 +261,6 @@ void ReplicatedBackend::on_change()
   }
   in_progress_ops.clear();
   clear_recovery_state();
-  cancel_pct_update();
 }
 
 int ReplicatedBackend::objects_read_sync(
@@ -470,86 +462,13 @@ void generate_transaction(
     });
 }
 
-void ReplicatedBackend::do_pct(OpRequestRef op)
-{
-  const MOSDPGPCT *m = static_cast<const MOSDPGPCT*>(op->get_req());
-  dout(10) << __func__ << ": received pct update to "
-	   << m->pg_committed_to << dendl;
-  parent->update_pct(m->pg_committed_to);
-}
-
-void ReplicatedBackend::send_pct_update()
-{
-  dout(10) << __func__ << ": sending pct update" << dendl;
-  ceph_assert(
-    PG_HAVE_FEATURE(parent->get_pg_acting_features(), PCT));
-  for (const auto &i: parent->get_acting_shards()) {
-    if (i == parent->whoami_shard()) continue;
-
-    auto *pct_update = new MOSDPGPCT(
-      spg_t(parent->whoami_spg_t().pgid, i.shard),
-      get_osdmap_epoch(), parent->get_interval_start_epoch(),
-      parent->get_pg_committed_to()
-    );
-
-    dout(10) << __func__ << ": sending pct update to i " << i
-	     << ", i.osd " << i.osd << dendl;
-    parent->send_message_osd_cluster(
-      i.osd, pct_update, get_osdmap_epoch());
-  }
-  dout(10) << __func__ << ": sending pct update complete" << dendl;
-}
-
-void ReplicatedBackend::maybe_kick_pct_update()
-{
-  if (!in_progress_ops.empty()) {
-    dout(20) << __func__ << ": not scheduling pct update, "
-	     << in_progress_ops.size() << " ops pending" << dendl;
-    return;
-  }
-
-  if (!PG_HAVE_FEATURE(parent->get_pg_acting_features(), PCT)) {
-    dout(20) << __func__ << ": not scheduling pct update, PCT feature not"
-	     << " supported" << dendl;
-    return;
-  }
-
-  if (pct_callback.is_scheduled()) {
-    derr << __func__
-	 << ": pct_callback is already scheduled, this should be impossible"
-	 << dendl;
-    return;
-  }
-
-  int64_t pct_delay;
-  if (!parent->get_pool().opts.get(
-	pool_opts_t::PCT_UPDATE_DELAY, &pct_delay)) {
-    dout(20) << __func__ << ": not scheduling pct update, PCT_UPDATE_DELAY not"
-	     << " set" << dendl;
-    return;
-  }
-
-  dout(10) << __func__ << ": scheduling pct update after "
-	   << pct_delay << " seconds" << dendl;
-  parent->get_pg_timer().schedule_after(
-    pct_callback, std::chrono::seconds(pct_delay));
-}
-
-void ReplicatedBackend::cancel_pct_update()
-{
-  if (pct_callback.is_scheduled()) {
-    dout(10) << __func__ << ": canceling pct update" << dendl;
-    parent->get_pg_timer().cancel(pct_callback);
-  }
-}
-
 void ReplicatedBackend::submit_transaction(
   const hobject_t &soid,
   const object_stat_sum_t &delta_stats,
   const eversion_t &at_version,
   PGTransactionUPtr &&_t,
   const eversion_t &trim_to,
-  const eversion_t &pg_committed_to,
+  const eversion_t &min_last_complete_ondisk,
   vector<pg_log_entry_t>&& _log_entries,
   std::optional<pg_hit_set_history_t> &hset_history,
   Context *on_all_commit,
@@ -557,8 +476,6 @@ void ReplicatedBackend::submit_transaction(
   osd_reqid_t reqid,
   OpRequestRef orig_op)
 {
-  cancel_pct_update();
-
   parent->apply_stats(
     soid,
     delta_stats);
@@ -600,7 +517,7 @@ void ReplicatedBackend::submit_transaction(
     tid,
     reqid,
     trim_to,
-    pg_committed_to,
+    min_last_complete_ondisk,
     added.size() ? *(added.begin()) : hobject_t(),
     removed.size() ? *(removed.begin()) : hobject_t(),
     log_entries,
@@ -616,7 +533,7 @@ void ReplicatedBackend::submit_transaction(
     hset_history,
     trim_to,
     at_version,
-    pg_committed_to,
+    min_last_complete_ondisk,
     true,
     op_t);
   
@@ -655,7 +572,6 @@ void ReplicatedBackend::op_commit(const ceph::ref_t<InProgressOp>& op)
     op->on_commit = 0;
     in_progress_ops.erase(op->tid);
   }
-  maybe_kick_pct_update();
 }
 
 void ReplicatedBackend::do_repop_reply(OpRequestRef op)
@@ -712,7 +628,6 @@ void ReplicatedBackend::do_repop_reply(OpRequestRef op)
       in_progress_ops.erase(iter);
     }
   }
-  maybe_kick_pct_update();
 }
 
 int ReplicatedBackend::be_deep_scrub(
@@ -1038,7 +953,7 @@ Message * ReplicatedBackend::generate_subop(
   ceph_tid_t tid,
   osd_reqid_t reqid,
   eversion_t pg_trim_to,
-  eversion_t pg_committed_to,
+  eversion_t min_last_complete_ondisk,
   hobject_t new_temp_oid,
   hobject_t discard_temp_oid,
   const bufferlist &log_entries,
@@ -1075,9 +990,13 @@ Message * ReplicatedBackend::generate_subop(
 
   wr->pg_trim_to = pg_trim_to;
 
-  // this feature is from 2019 (6f12bf27cb91), assume present
-  ceph_assert(HAVE_FEATURE(parent->min_peer_features(), OSD_REPOP_MLCOD));
-  wr->pg_committed_to = pg_committed_to;
+  if (HAVE_FEATURE(parent->min_peer_features(), OSD_REPOP_MLCOD)) {
+    wr->min_last_complete_ondisk = min_last_complete_ondisk;
+  } else {
+    /* Some replicas need this field to be at_version.  New replicas
+     * will ignore it */
+    wr->set_rollback_to(at_version);
+  }
 
   wr->new_temp_oid = new_temp_oid;
   wr->discard_temp_oid = discard_temp_oid;
@@ -1091,7 +1010,7 @@ void ReplicatedBackend::issue_op(
   ceph_tid_t tid,
   osd_reqid_t reqid,
   eversion_t pg_trim_to,
-  eversion_t pg_committed_to,
+  eversion_t min_last_complete_ondisk,
   hobject_t new_temp_oid,
   hobject_t discard_temp_oid,
   const vector<pg_log_entry_t> &log_entries,
@@ -1124,7 +1043,7 @@ void ReplicatedBackend::issue_op(
 	  tid,
 	  reqid,
 	  pg_trim_to,
-	  pg_committed_to,
+	  min_last_complete_ondisk,
 	  new_temp_oid,
 	  discard_temp_oid,
 	  logs,
@@ -1226,7 +1145,7 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
     m->updated_hit_set_history,
     m->pg_trim_to,
     m->version, /* Replicated PGs don't have rollback info */
-    m->pg_committed_to,
+    m->min_last_complete_ondisk,
     update_snaps,
     rm->localt,
     async);
